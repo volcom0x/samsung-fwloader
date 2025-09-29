@@ -1,0 +1,1 @@
+variables:\n  PUSH_TO_GITHUB: "true"\n  GITHUB_REPO_PRIVATE: "false"\ninclude:\n  - project: '${SHARED-CONF}'\n    file: 'github-deploy.yml'\n
