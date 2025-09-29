@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # samsung-fw.sh — repo-local, production-grade, fully automatic Samsung firmware script
 # EXAMPLES:
-#   ./samsung-fw.sh --model SM-S928B --region THL --identity 353607434305341 --flash-keep
+#   ./samsung-fw.sh --model SM-S928B --region THL --identity 355607434305341 --flash-keep
 #   ./samsung-fw.sh --model SM-S928B --region THL --identity R5CXXXXXXX --flash-wipe
 set -Eeuo pipefail
 IFS=$'\n\t'
