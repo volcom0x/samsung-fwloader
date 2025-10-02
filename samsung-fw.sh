@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # samsung-fw.sh — repo-local, production-grade, fully automatic Samsung firmware script
 # EXAMPLES:
-#   ./samsung-fw.sh --model SM-S928B --region THL --identity 355607434305341 --flash-keep
+#   ./samsung-fw.sh --model SM-S928B --region THL --identity 355655434305341 --flash-keep
 #   ./samsung-fw.sh --model SM-S928B --region THL --identity R5CXXXXXXX --flash-wipe
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -128,6 +128,46 @@ log_file(){ local pfx="$1"; date +"${LOG_DIR}/${pfx}-%Y%m%d-%H%M%S.log"; }
 have_glob(){ compgen -G "$1" >/dev/null 2>&1; }  # true if pattern matches any files
 first_match(){ compgen -G "$1" | head -n1; }     # prints first match or empty
 
+# Normalize weird ZIP names (handles "*.zip." and "*.zip.*", but ignores "*.zip.enc4")
+normalize_zip_names(){
+  shopt -s nullglob
+  # case 1: "*.zip."  → "*.zip"
+  for f in "${FW_DIR}"/*.zip.; do
+    mv -f -- "$f" "${f%.}" || true
+  done
+  # case 2: "*.zip.*" (but not .enc4) → strip trailing extra extension after .zip
+  for f in "${FW_DIR}"/*.zip.*; do
+    [[ "$f" == *.zip.enc4 ]] && continue
+    mv -f -- "$f" "${f%.*}" || true
+  done
+  shopt -u nullglob
+}
+
+# Extract the newest firmware archive with bsdtar if present (ZIP64-safe), else unzip
+extract_firmware_zip(){
+  shopt -s nullglob
+  local candidates=( "${FW_DIR}"/*.zip "${FW_DIR}"/*.zip.* "${FW_DIR}"/*.zip. )
+  # Re-check after normalization
+  if ((${#candidates[@]}==0)); then
+    normalize_zip_names
+    candidates=( "${FW_DIR}"/*.zip "${FW_DIR}"/*.zip.* "${FW_DIR}"/*.zip. )
+  fi
+  # pick newest by mtime
+  local zipf=""
+  if ((${#candidates[@]}>0)); then
+    zipf="$(ls -1t "${candidates[@]}" 2>/dev/null | head -n1 || true)"
+  fi
+  shopt -u nullglob
+  [[ -n "$zipf" ]] || return 0
+
+  say "Extracting firmware archive → Odin files…"
+  if command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -xf "$zipf" -C "${FW_DIR}"
+  else
+    unzip -o "$zipf" -d "${FW_DIR}" >/dev/null
+  fi
+}
+
 sl3_shell(){
   local model="$1" region="$2" identity="$3"; shift 3
   local script=""; for c in "$@"; do script+="${c}\n"; done; script+="exit\n"
@@ -146,7 +186,7 @@ sl3_shell(){
 }
 
 discover_version(){
-  # samloader3 list: latest only (-l) and quiet version string (-q) per README. :contentReference[oaicite:4]{index=4}
+  # samloader3 `list -l -q` prints latest version string in AP/CSC/CP/BL form
   local out; out="$(sl3_shell "$MODEL" "$REGION" "$IDENTITY" "list -l -q")" || return 1
   grep -Eo '[A-Z0-9]{5,}/[A-Z0-9]{5,}/[A-Z0-9]{5,}/[A-Z0-9]{5,}' <<< "$out" | head -n1
 }
@@ -160,7 +200,7 @@ download_and_decrypt(){
 }
 
 explicit_decrypt_if_needed(){
-  # If only enc4 exists, decrypt explicitly per README: decrypt -v "$version" "/path/firmware.zip.enc4" :contentReference[oaicite:5]{index=5}
+  # If only enc4 exists, decrypt explicitly: decrypt -v "$version" "/path/firmware.zip.enc4"
   local version="$1"
   if have_glob "${FW_DIR}/*.zip.enc4"; then
     local enc4; enc4="$(first_match "${FW_DIR}/*.zip.enc4")"
@@ -171,17 +211,21 @@ explicit_decrypt_if_needed(){
 }
 
 finalize_odin_files(){
-  # unzip any ZIP to produce BL/AP/CP/CSC/HOME_CSC
-  if have_glob "${FW_DIR}/*.zip"; then
-    local zipf; zipf="$(first_match "${FW_DIR}/*.zip")"
-    say "Extracting ZIP → Odin files…"
-    unzip -o "${zipf}" -d "${FW_DIR}" >/dev/null || true
-  fi
+  normalize_zip_names
+  extract_firmware_zip
+
   # sanity: ensure .tar.md5 exist
-  if ! have_glob "${FW_DIR}/BL_*.tar.md5" || ! have_glob "${FW_DIR}/AP_*.tar.md5" || \
-     ! have_glob "${FW_DIR}/CP_*.tar.md5" || { [[ "$FLASH_MODE" == "keep" ]] && ! have_glob "${FW_DIR}/HOME_CSC_*.tar.md5"; } || \
-     { [[ "$FLASH_MODE" == "wipe" ]] && ! have_glob "${FW_DIR}/CSC_*.tar.md5"; }; then
-    ls -lh "${FW_DIR}" || true
+  local ok=1
+  have_glob "${FW_DIR}/BL_*.tar.md5" || ok=0
+  have_glob "${FW_DIR}/AP_*.tar.md5" || ok=0
+  have_glob "${FW_DIR}/CP_*.tar.md5" || ok=0
+  if [[ "$FLASH_MODE" == "keep" ]]; then
+    have_glob "${FW_DIR}/HOME_CSC_*.tar.md5" || ok=0
+  else
+    have_glob "${FW_DIR}/CSC_*.tar.md5" || ok=0
+  fi
+  if [[ $ok -ne 1 ]]; then
+    ls -lah "${FW_DIR}" || true
     die "Odin files not present after decrypt. See latest log in ${LOG_DIR} (samloader3-*.log)."
   fi
 }
@@ -228,7 +272,7 @@ else
   CSC_FILE="$(first_match "${FW_DIR}/CSC_*.tar.md5" || true)"; [[ -n "${CSC_FILE}" ]] || die "CSC file missing"
 fi
 
-# Bootloader binary hint (U#) to discourage BL downgrades; Odin4 blocks anyway with SW REV CHECK FAIL. :contentReference[oaicite:6]{index=6}
+# Bootloader binary hint (U#) to discourage BL downgrades; Odin4 blocks anyway with SW REV CHECK FAIL.
 if [[ -n "${AP_FILE}" ]]; then
   if BLHINT="$(grep -Eo '[US][0-9]' <<< "$(basename "${AP_FILE}")" | head -n1)"; then
     say "Bootloader binary hint: ${BLHINT/ /} — do NOT attempt BL downgrades."
@@ -238,7 +282,7 @@ fi
 # USB driver quirk mitigation (Linux)
 sudo rmmod cdc_acm >/dev/null 2>&1 || true
 
-# Wait for device in Download Mode (VolUp+VolDown while plugging USB; confirm VolUp). Odin4 lists devices with -l. :contentReference[oaicite:7]{index=7}
+# Wait for device in Download Mode (VolUp+VolDown while plugging USB; confirm VolUp). Odin4 lists devices with -l.
 say "Put device in Download (Odin) Mode. Waiting for odin4 to see a device…"
 for i in {1..60}; do
   if "${ODIN4}" -l 2>/dev/null | grep -q '/dev/bus/usb/'; then
@@ -247,7 +291,7 @@ for i in {1..60}; do
   sleep 2
 done
 
-# Build & run odin4 command (documented flags: -b BL -a AP -c CP -s CSC/HOME_CSC). :contentReference[oaicite:8]{index=8}
+# Build & run odin4 command (documented flags: -b BL -a AP -c CP -s CSC/HOME_CSC).
 ODIN_CMD=( "${ODIN4}" -b "${BL_FILE}" -a "${AP_FILE}" -c "${CP_FILE}" -s "${CSC_FILE}" )
 [[ -n "${DEVICE}" ]] && ODIN_CMD+=( -d "${DEVICE}" )
 
@@ -262,6 +306,6 @@ set -e
 say "Flash complete."
 if [[ "${KEEP_FILES}" != "1" ]]; then
   say "Cleaning firmware artifacts…"
-  rm -f "${FW_DIR}"/*.tar.md5 "${FW_DIR}"/*.zip "${FW_DIR}"/*.enc4 2>/dev/null || true
+  rm -f "${REPO_DIR}"/*.zip. "${FW_DIR}"/*.tar.md5 "${FW_DIR}"/*.zip "${FW_DIR}"/*.zip.* "${FW_DIR}"/*.zip. "${FW_DIR}"/*.enc4 2>/dev/null || true
 fi
 say "Done."
